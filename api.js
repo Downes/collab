@@ -142,6 +142,8 @@ export async function handleRequest({ request, response }) {
             ? `<p><strong>Owner DID:</strong> <code>${esc(ownerDisplay)}</code></p>`
             : `<p><strong>Owner:</strong> ${esc(ownerDisplay)}</p>`)
         : ''
+      const showEditor = !!doc.allow_anonymous
+      const isEditable = doc.allow_anonymous && mode === 'edit'
       response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', ...cors })
       response.end(`<!DOCTYPE html>
 <html lang="en">
@@ -150,7 +152,7 @@ export async function handleRequest({ request, response }) {
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>${esc(title)} — Collab</title>
   <style>
-    body { font-family: sans-serif; max-width: 600px; margin: 60px auto; padding: 0 20px; color: #222; }
+    body { font-family: sans-serif; max-width: ${showEditor ? '860px' : '600px'}; margin: 40px auto; padding: 0 20px; color: #222; }
     h1   { font-size: 1.4em; margin-bottom: 4px; }
     code { background: #f4f4f4; padding: 2px 6px; border-radius: 3px; font-size: 0.9em; word-break: break-all; }
     .badge { display: inline-block; padding: 2px 8px; border-radius: 3px; font-size: 0.8em;
@@ -160,19 +162,59 @@ export async function handleRequest({ request, response }) {
              background: #f5f5f5; font-size: 0.85em; }
     button:hover { background: #e8e8e8; }
     .note { margin-top: 24px; font-size: 0.85em; color: #666; border-top: 1px solid #eee; padding-top: 12px; }
+    #collab-status { font-size: 0.8em; color: #888; margin: 12px 0 4px; }
+    #editor-area { border: 1px solid #ddd; border-radius: 4px; background: ${isEditable ? '#fff' : '#fafafa'}; margin-top: 4px; }
+    #editor-area .ProseMirror { outline: none; min-height: 240px; padding: 14px; color: #111; }
+    #editor-area .ProseMirror p { margin: 0.5em 0; }
+    #editor-area .ProseMirror h1 { font-size: 1.6em; margin: 0.8em 0 0.3em; }
+    #editor-area .ProseMirror h2 { font-size: 1.3em; margin: 0.7em 0 0.3em; }
+    #editor-area .ProseMirror ul, #editor-area .ProseMirror ol { padding-left: 1.5em; }
+    #editor-area .ProseMirror blockquote { border-left: 3px solid #ccc; margin: 0.5em 0; padding-left: 1em; color: #555; }
   </style>
 </head>
 <body>
   <h1>${esc(title)}</h1>
   <div class="badge">${esc(modeLabel)}</div>
   ${ownerLine}
-  <p><strong>Server:</strong> <code>${esc(SERVER_WS_URL)}</code></p>
-  <p><strong>Document ID:</strong> <code>${esc(id)}</code></p>
   <div class="link-row">
     <code id="share-link">${esc(shareLink)}</code>
     <button onclick="navigator.clipboard.writeText(document.getElementById('share-link').textContent).then(()=>{this.textContent='Copied!';setTimeout(()=>this.textContent='Copy',1500)})">Copy</button>
   </div>
-  <p class="note">To open this document, paste the link above into a CList collab panel.</p>
+  ${showEditor ? `
+  <div id="collab-status">connecting…</div>
+  <div id="editor-area"><div id="tiptap-editor"></div></div>
+  <script type="module">
+    import { Editor }        from 'https://esm.sh/@tiptap/core@2'
+    import StarterKit        from 'https://esm.sh/@tiptap/starter-kit@2'
+    import Collaboration     from 'https://esm.sh/@tiptap/extension-collaboration@2'
+    import { HocuspocusProvider } from 'https://esm.sh/@hocuspocus/provider@2'
+    import * as Y            from 'https://esm.sh/yjs@13'
+    const ydoc = new Y.Doc()
+    const provider = new HocuspocusProvider({
+      url:        ${JSON.stringify(SERVER_WS_URL)},
+      name:       ${JSON.stringify(id)},
+      document:   ydoc,
+      token:      'anonymous',
+      parameters: ${isEditable ? '{}' : '{ mode: "read" }'},
+      onStatus: ({ status }) => {
+        const s = document.getElementById('collab-status')
+        if (s) s.textContent = status
+      },
+      onAuthenticationFailed: () => {
+        const s = document.getElementById('collab-status')
+        if (s) s.textContent = 'Authentication required — this document is not publicly accessible.'
+      },
+    })
+    new Editor({
+      element:    document.getElementById('tiptap-editor'),
+      editable:   ${isEditable},
+      extensions: [
+        StarterKit.configure({ history: false }),
+        Collaboration.configure({ document: ydoc }),
+      ],
+    })
+  </script>` : `
+  <p class="note">To open this document, paste the link above into a CList collab panel.</p>`}
 </body>
 </html>`)
     } else {
