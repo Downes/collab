@@ -1,0 +1,10 @@
+{
+  "name": "collab",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "@hocuspocus/server": "^2.13.5",
+    "better-sqlite3": "^9.6.0",
+    "yjs": "^13.6.18"
+  }
+}

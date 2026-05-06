@@ -1,0 +1,17 @@
+services:
+  collab:
+    build: .
+    container_name: collab
+    restart: unless-stopped
+    environment:
+      - KVSTORE_URL=http://kvstore:5000
+      - DATA_DIR=/data
+      - PORT=3003
+    volumes:
+      - ./data:/data
+    networks:
+      - web
+
+networks:
+  web:
+    external: true
