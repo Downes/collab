@@ -74,21 +74,31 @@ const server = Server.configure({
       .prepare('SELECT data FROM documents WHERE id = ?')
       .get(documentName)
     if (row?.data) {
-      Y.applyUpdate(document, row.data)
+      try {
+        Y.applyUpdate(document, row.data)
+      } catch (e) {
+        // Corrupt Yjs binary — log and serve empty document rather than crashing.
+        console.error(`[collab] corrupt Yjs state for "${documentName}", serving empty document:`, e.message)
+        db.prepare('UPDATE documents SET data = NULL WHERE id = ?').run(documentName)
+      }
     }
     return document
   },
 
   // Persist Yjs state to SQLite after each change.
   async onStoreDocument({ documentName, document }) {
-    const data = Buffer.from(Y.encodeStateAsUpdate(document))
-    db.prepare(`
-      INSERT INTO documents (id, data, updated_at)
-      VALUES (?, ?, unixepoch())
-      ON CONFLICT(id) DO UPDATE SET
-        data       = excluded.data,
-        updated_at = excluded.updated_at
-    `).run(documentName, data)
+    try {
+      const data = Buffer.from(Y.encodeStateAsUpdate(document))
+      db.prepare(`
+        INSERT INTO documents (id, data, updated_at)
+        VALUES (?, ?, unixepoch())
+        ON CONFLICT(id) DO UPDATE SET
+          data       = excluded.data,
+          updated_at = excluded.updated_at
+      `).run(documentName, data)
+    } catch (e) {
+      console.error(`[collab] failed to store document "${documentName}":`, e.message)
+    }
   },
 
   onRequest: handleRequest,
