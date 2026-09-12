@@ -3,6 +3,11 @@ services:
     build: .
     container_name: collab
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
     environment:
       - KVSTORE_URL=http://kvstore:5000
       - DATA_DIR=/data
