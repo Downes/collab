@@ -1,11 +1,11 @@
 import { Server } from '@hocuspocus/server'
 import * as Y from 'yjs'
 import { db } from './db.js'
-import { verifyToken, resolveUserDid, kvHostShort } from './auth.js'
+import { verifyToken, resolveUserDid, kvHostShort, resolveKvstoreUrl } from './auth.js'
 import { handleRequest } from './api.js'
+import { getSetting } from './admin_settings.js'
 
-const PORT        = parseInt(process.env.PORT || '3003')
-const KVSTORE_URL = process.env.KVSTORE_URL   || 'http://kvstore:5000'
+const PORT = parseInt(process.env.PORT || '3003')
 
 const server = Server.configure({
   port: PORT,
@@ -15,6 +15,9 @@ const server = Server.configure({
   // Anonymous access (no token or token='anonymous') is allowed only when
   // the document record has allow_anonymous=1.
   async onAuthenticate({ token, documentName, connection, requestParameters }) {
+    if (getSetting(db, 'WS_ENABLED', 'true') === 'false') {
+      throw new Error('Real-time editing temporarily disabled by administrator')
+    }
     if (requestParameters?.get('mode') === 'read') {
       connection.isReadOnly = true
     }
@@ -26,9 +29,12 @@ const server = Server.configure({
       throw new Error('Authentication required')
     }
     // Client may pass kvstoreUrl so users from any kvstore instance can authenticate.
+    // verifyToken resolves its own default (env var, or an admin override) when
+    // clientKvUrl is null; resolveKvstoreUrl mirrors that same resolution for
+    // the non-auth lookups below so they agree on which instance was used.
     const clientKvUrl   = requestParameters?.get('kvstoreUrl') || null
-    const effectiveKvUrl = clientKvUrl || KVSTORE_URL
-    const username = await verifyToken(token, effectiveKvUrl)
+    const effectiveKvUrl = resolveKvstoreUrl(clientKvUrl)
+    const username = await verifyToken(token, clientKvUrl)
     if (!username) throw new Error('Invalid token')
 
     // Resolve the user's portable DID (did:key preferred, did:web fallback,

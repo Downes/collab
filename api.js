@@ -1,9 +1,43 @@
 import { db } from './db.js'
-import { verifyToken, resolveUserDid, kvHostShort } from './auth.js'
+import { verifyToken, resolveUserDid, kvHostShort, resolveKvstoreUrl } from './auth.js'
+import { handleAdminSettingsRoutes, isAdmin, getSetting, SettingField } from './admin_settings.js'
 import { randomBytes } from 'crypto'
 
 const PORT          = parseInt(process.env.PORT  || '3003')
 const SERVER_WS_URL = process.env.SERVER_WS_URL || 'wss://collab.mooc.ca'
+const KVSTORE_URL_ENV_DEFAULT = process.env.KVSTORE_URL || 'http://kvstore:5000'
+
+const SETTINGS_SCHEMA = [
+  new SettingField(
+    'ENABLED', 'Enabled', 'boolean', false, null,
+    "When off, this server's HTTP API (everything except /admin/settings) " +
+    'returns 503. Independent of WS_ENABLED below, which gates the ' +
+    'real-time editing WebSocket protocol.',
+  ),
+  new SettingField(
+    'WS_ENABLED', 'Real-time editing enabled', 'boolean', false, null,
+    'When off, new WebSocket (Hocuspocus) connections are rejected — ' +
+    'existing open editing sessions are not forcibly dropped. Independent ' +
+    'of ENABLED above, which gates the HTTP API.',
+  ),
+  new SettingField(
+    'KVSTORE_URL', 'KVStore URL', 'url', false, null,
+    "Default kvstore instance used to verify a client's Bearer token when the " +
+    "client doesn't supply its own kvstoreUrl. Note: a client can already pass " +
+    "its own kvstoreUrl per-request (only an HTTPS check applies to that), so " +
+    'this setting is a default, not a security boundary.',
+  ),
+]
+const SETTINGS_DEFAULTS = { ENABLED: 'true', WS_ENABLED: 'true', KVSTORE_URL: KVSTORE_URL_ENV_DEFAULT }
+
+async function requireAdmin(request) {
+  const authHeader = request.headers['authorization'] || ''
+  const token = authHeader.replace(/^Bearer\s+/i, '').trim()
+  const username = await verifyToken(token)
+  if (!username) return { username: null, err: { status: 401, body: { error: 'unauthorized' } } }
+  if (!isAdmin(username)) return { username: null, err: { status: 403, body: { error: 'forbidden' } } }
+  return { username, err: null }
+}
 
 function esc(s) {
   return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
@@ -52,6 +86,12 @@ export async function handleRequest({ request, response }) {
     return
   }
 
+  if (url.pathname !== '/admin/settings' && getSetting(db, 'ENABLED', 'true') === 'false') {
+    response.writeHead(503, { 'Content-Type': 'application/json' })
+    response.end(JSON.stringify({ error: 'Service temporarily disabled by administrator' }))
+    return
+  }
+
   // POST /api/register — register a user on this collab server.
   if (method === 'POST' && url.pathname === '/api/register') {
     const authHeader = request.headers['authorization'] || ''
@@ -76,7 +116,7 @@ export async function handleRequest({ request, response }) {
           username = excluded.username,
           kvhost = excluded.kvhost,
           registered_at = unixepoch()
-      `).run(didInfo.didKey, didInfo.didWeb || null, username, kvHostShort(process.env.KVSTORE_URL || 'http://kvstore:5000'))
+      `).run(didInfo.didKey, didInfo.didWeb || null, username, kvHostShort())
     }
     response.writeHead(200, { 'Content-Type': 'application/json' })
     response.end(JSON.stringify({ username, didKey: didInfo?.didKey || null, didWeb: didInfo?.didWeb || null }))
@@ -104,7 +144,7 @@ export async function handleRequest({ request, response }) {
       if (!id) throw new Error('id is required')
       const didInfo   = await resolveUserDid(postUsername)
       const namespace = didInfo?.didKey || didInfo?.didWeb
-        || `${postUsername}@${kvHostShort(process.env.KVSTORE_URL || 'http://kvstore:5000')}`
+        || `${postUsername}@${kvHostShort()}`
       const expires_at = expires_in ? Math.floor(Date.now() / 1000) + expires_in : null
       db.prepare(`
         INSERT OR IGNORE INTO documents (id, title, allow_anonymous, expires_at, owner)
@@ -124,13 +164,13 @@ export async function handleRequest({ request, response }) {
     const authHeader = request.headers['authorization'] || ''
     const token = authHeader.replace(/^Bearer\s+/i, '').trim()
     const listKvUrl  = url.searchParams.get('kvstoreUrl') || null
-    const listEffKv  = listKvUrl || process.env.KVSTORE_URL || 'http://kvstore:5000'
-    const listUser   = await verifyToken(token, listEffKv)
+    const listUser   = await verifyToken(token, listKvUrl)
     if (!token || !listUser) {
       response.writeHead(401, { 'Content-Type': 'application/json' })
       response.end(JSON.stringify({ error: 'unauthorized' }))
       return
     }
+    const listEffKv  = resolveKvstoreUrl(listKvUrl)
     const didInfo   = await resolveUserDid(listUser, listEffKv)
     const namespace = didInfo?.didKey || didInfo?.didWeb
       || `${listUser}@${kvHostShort(listEffKv)}`
@@ -458,13 +498,13 @@ export async function handleRequest({ request, response }) {
     const authHeader = request.headers['authorization'] || ''
     const token = authHeader.replace(/^Bearer\s+/i, '').trim()
     const clientKvUrl   = url.searchParams.get('kvstoreUrl') || null
-    const effectiveKvUrl = clientKvUrl || process.env.KVSTORE_URL || 'http://kvstore:5000'
-    const patchUsername = await verifyToken(token, effectiveKvUrl)
+    const patchUsername = await verifyToken(token, clientKvUrl)
     if (!token || !patchUsername) {
       response.writeHead(401, { 'Content-Type': 'application/json' })
       response.end(JSON.stringify({ error: 'unauthorized' }))
       return
     }
+    const effectiveKvUrl = resolveKvstoreUrl(clientKvUrl)
     const id = decodeURIComponent(url.pathname.replace('/api/documents/', ''))
     // Ownership check: resolve the caller's namespace and compare to the stored owner.
     const didInfo   = await resolveUserDid(patchUsername, effectiveKvUrl)
@@ -518,6 +558,10 @@ export async function handleRequest({ request, response }) {
     }
     return
   }
+
+  if (await handleAdminSettingsRoutes({
+    method, url, request, response, db, schema: SETTINGS_SCHEMA, requireAdmin, defaults: SETTINGS_DEFAULTS,
+  })) return
 
   // Unrecognised route.
   response.writeHead(404, { 'Content-Type': 'application/json' })

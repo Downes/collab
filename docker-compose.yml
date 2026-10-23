@@ -12,6 +12,7 @@ services:
       - KVSTORE_URL=http://kvstore:5000
       - DATA_DIR=/data
       - PORT=3003
+      - ADMIN_USERNAMES=downes
     volumes:
       - ./data:/data
     networks:

@@ -1,8 +1,11 @@
 import Database from 'better-sqlite3'
+import { initSettingsTable } from './admin_settings.js'
 
 const DATA_DIR = process.env.DATA_DIR || '/data'
 
 export const db = new Database(`${DATA_DIR}/collab.db`)
+
+initSettingsTable(db)
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS documents (
