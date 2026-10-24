@@ -9,7 +9,7 @@ services:
         max-size: "50m"
         max-file: "5"
     environment:
-      - KVSTORE_URL=http://kvstore:5000
+      - KVSTORE_URL=https://kvstore.mooc.ca
       - DATA_DIR=/data
       - PORT=3003
       - ADMIN_USERNAMES=downes

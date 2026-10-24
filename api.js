@@ -1,11 +1,11 @@
 import { db } from './db.js'
-import { verifyToken, resolveUserDid, kvHostShort, resolveKvstoreUrl } from './auth.js'
+import { verifyIdentity, resolveUserDid, resolveNamespace, ownsDocument, defaultKvstoreUrl, kvHostShort } from './auth.js'
 import { handleAdminSettingsRoutes, isAdmin, getSetting, SettingField } from './admin_settings.js'
 import { randomBytes } from 'crypto'
 
 const PORT          = parseInt(process.env.PORT  || '3003')
 const SERVER_WS_URL = process.env.SERVER_WS_URL || 'wss://collab.mooc.ca'
-const KVSTORE_URL_ENV_DEFAULT = process.env.KVSTORE_URL || 'http://kvstore:5000'
+const KVSTORE_URL_ENV_DEFAULT = process.env.KVSTORE_URL || 'https://kvstore.mooc.ca'
 
 const SETTINGS_SCHEMA = [
   new SettingField(
@@ -22,21 +22,32 @@ const SETTINGS_SCHEMA = [
   ),
   new SettingField(
     'KVSTORE_URL', 'KVStore URL', 'url', false, null,
-    "Default kvstore instance used to verify a client's Bearer token when the " +
-    "client doesn't supply its own kvstoreUrl. Note: a client can already pass " +
-    "its own kvstoreUrl per-request (only an HTTPS check applies to that), so " +
-    'this setting is a default, not a security boundary.',
+    'Opaque (pre-migration) token fallback verification target, and the sole ' +
+    'trusted admin issuer. Must be the public HTTPS URL of this kvstore ' +
+    "instance, not an internal Docker address — a real JWT's own iss claim " +
+    'is what gets verified for ordinary auth (open to any issuer, no ' +
+    'allowlist), so this setting only matters for opaque tokens and for ' +
+    'deciding which issuer is trusted to grant admin rights.',
   ),
 ]
 const SETTINGS_DEFAULTS = { ENABLED: 'true', WS_ENABLED: 'true', KVSTORE_URL: KVSTORE_URL_ENV_DEFAULT }
 
+// ADMIN_USERNAMES stays issuer-gated even though ordinary auth is now open to
+// any issuer: an admin check means "this specific person, as vouched for by
+// an instance I trust," not "anyone who can mint a matching username" on
+// some other kvstore. KVSTORE_URL is DB-overridable here (see schema above),
+// so this can't just defer to admin_settings.js's own bare-username isAdmin().
+function isAdminIdentity(identity) {
+  return isAdmin(identity.username) && identity.iss === defaultKvstoreUrl()
+}
+
 async function requireAdmin(request) {
   const authHeader = request.headers['authorization'] || ''
   const token = authHeader.replace(/^Bearer\s+/i, '').trim()
-  const username = await verifyToken(token)
-  if (!username) return { username: null, err: { status: 401, body: { error: 'unauthorized' } } }
-  if (!isAdmin(username)) return { username: null, err: { status: 403, body: { error: 'forbidden' } } }
-  return { username, err: null }
+  const identity = await verifyIdentity(token)
+  if (!identity) return { username: null, err: { status: 401, body: { error: 'unauthorized' } } }
+  if (!isAdminIdentity(identity)) return { username: null, err: { status: 403, body: { error: 'forbidden' } } }
+  return { username: identity.username, err: null }
 }
 
 function esc(s) {
@@ -96,8 +107,8 @@ export async function handleRequest({ request, response }) {
   if (method === 'POST' && url.pathname === '/api/register') {
     const authHeader = request.headers['authorization'] || ''
     const token = authHeader.replace(/^Bearer\s+/i, '').trim()
-    const username = await verifyToken(token)
-    if (!username) {
+    const identity = await verifyIdentity(token)
+    if (!identity) {
       response.writeHead(401, { 'Content-Type': 'application/json' })
       response.end(JSON.stringify({ error: 'unauthorized' }))
       return
@@ -106,7 +117,8 @@ export async function handleRequest({ request, response }) {
       request.on('data', () => {})
       request.on('end', resolve)
     })
-    const didInfo = await resolveUserDid(username)
+    const { username, iss } = identity
+    const didInfo = await resolveUserDid(username, iss)
     if (didInfo?.didKey) {
       db.prepare(`
         INSERT INTO users (did_key, did_web, username, kvhost, registered_at)
@@ -116,7 +128,7 @@ export async function handleRequest({ request, response }) {
           username = excluded.username,
           kvhost = excluded.kvhost,
           registered_at = unixepoch()
-      `).run(didInfo.didKey, didInfo.didWeb || null, username, kvHostShort())
+      `).run(didInfo.didKey, didInfo.didWeb || null, username, kvHostShort(iss))
     }
     response.writeHead(200, { 'Content-Type': 'application/json' })
     response.end(JSON.stringify({ username, didKey: didInfo?.didKey || null, didWeb: didInfo?.didWeb || null }))
@@ -127,8 +139,8 @@ export async function handleRequest({ request, response }) {
   if (method === 'POST' && url.pathname === '/api/documents') {
     const authHeader = request.headers['authorization'] || ''
     const token = authHeader.replace(/^Bearer\s+/i, '').trim()
-    const postUsername = await verifyToken(token)
-    if (!token || !postUsername) {
+    const identity = await verifyIdentity(token)
+    if (!token || !identity) {
       response.writeHead(401, { 'Content-Type': 'application/json' })
       response.end(JSON.stringify({ error: 'unauthorized' }))
       return
@@ -142,9 +154,7 @@ export async function handleRequest({ request, response }) {
     try {
       const { id, title, allow_anonymous, expires_in } = JSON.parse(body)
       if (!id) throw new Error('id is required')
-      const didInfo   = await resolveUserDid(postUsername)
-      const namespace = didInfo?.didKey || didInfo?.didWeb
-        || `${postUsername}@${kvHostShort()}`
+      const namespace = await resolveNamespace(identity)
       const expires_at = expires_in ? Math.floor(Date.now() / 1000) + expires_in : null
       db.prepare(`
         INSERT OR IGNORE INTO documents (id, title, allow_anonymous, expires_at, owner)
@@ -163,21 +173,20 @@ export async function handleRequest({ request, response }) {
   if (method === 'GET' && url.pathname === '/api/documents') {
     const authHeader = request.headers['authorization'] || ''
     const token = authHeader.replace(/^Bearer\s+/i, '').trim()
-    const listKvUrl  = url.searchParams.get('kvstoreUrl') || null
-    const listUser   = await verifyToken(token, listKvUrl)
-    if (!token || !listUser) {
+    const identity = await verifyIdentity(token)
+    if (!token || !identity) {
       response.writeHead(401, { 'Content-Type': 'application/json' })
       response.end(JSON.stringify({ error: 'unauthorized' }))
       return
     }
-    const listEffKv  = resolveKvstoreUrl(listKvUrl)
-    const didInfo   = await resolveUserDid(listUser, listEffKv)
-    const namespace = didInfo?.didKey || didInfo?.didWeb
-      || `${listUser}@${kvHostShort(listEffKv)}`
+    const namespace  = await resolveNamespace(identity)
+    // Also match the legacy `username@kvhost` owner shape (see ownsDocument)
+    // so documents created before this migration still show up in the list.
+    const legacyOwner = `${identity.username}@${kvHostShort(identity.iss)}`
     const docs = db.prepare(
       `SELECT id, title, allow_anonymous, created_at, updated_at, expires_at
-       FROM documents WHERE owner = ? ORDER BY updated_at DESC`
-    ).all(namespace)
+       FROM documents WHERE owner IN (?, ?) ORDER BY updated_at DESC`
+    ).all(namespace, legacyOwner)
     response.writeHead(200, { 'Content-Type': 'application/json' })
     response.end(JSON.stringify(docs))
     return
@@ -497,26 +506,23 @@ export async function handleRequest({ request, response }) {
   if (method === 'PATCH' && url.pathname.startsWith('/api/documents/')) {
     const authHeader = request.headers['authorization'] || ''
     const token = authHeader.replace(/^Bearer\s+/i, '').trim()
-    const clientKvUrl   = url.searchParams.get('kvstoreUrl') || null
-    const patchUsername = await verifyToken(token, clientKvUrl)
-    if (!token || !patchUsername) {
+    const identity = await verifyIdentity(token)
+    if (!token || !identity) {
       response.writeHead(401, { 'Content-Type': 'application/json' })
       response.end(JSON.stringify({ error: 'unauthorized' }))
       return
     }
-    const effectiveKvUrl = resolveKvstoreUrl(clientKvUrl)
     const id = decodeURIComponent(url.pathname.replace('/api/documents/', ''))
-    // Ownership check: resolve the caller's namespace and compare to the stored owner.
-    const didInfo   = await resolveUserDid(patchUsername, effectiveKvUrl)
-    const namespace = didInfo?.didKey || didInfo?.didWeb
-      || `${patchUsername}@${kvHostShort(effectiveKvUrl)}`
+    // Ownership check: resolve the caller's namespace and compare to the
+    // stored owner, accepting the legacy pre-migration owner shape too.
+    const namespace = await resolveNamespace(identity)
     const doc = db.prepare('SELECT owner FROM documents WHERE id = ?').get(id)
     if (!doc) {
       response.writeHead(404, { 'Content-Type': 'application/json' })
       response.end(JSON.stringify({ error: 'document not found' }))
       return
     }
-    if (doc.owner && doc.owner !== namespace) {
+    if (doc.owner && !ownsDocument(doc.owner, identity, namespace)) {
       response.writeHead(403, { 'Content-Type': 'application/json' })
       response.end(JSON.stringify({ error: 'forbidden' }))
       return

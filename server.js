@@ -1,7 +1,7 @@
 import { Server } from '@hocuspocus/server'
 import * as Y from 'yjs'
 import { db } from './db.js'
-import { verifyToken, resolveUserDid, kvHostShort, resolveKvstoreUrl } from './auth.js'
+import { verifyIdentity, resolveUserDid, kvHostShort } from './auth.js'
 import { handleRequest } from './api.js'
 import { getSetting } from './admin_settings.js'
 
@@ -28,20 +28,17 @@ const server = Server.configure({
       if (doc?.allow_anonymous) return
       throw new Error('Authentication required')
     }
-    // Client may pass kvstoreUrl so users from any kvstore instance can authenticate.
-    // verifyToken resolves its own default (env var, or an admin override) when
-    // clientKvUrl is null; resolveKvstoreUrl mirrors that same resolution for
-    // the non-auth lookups below so they agree on which instance was used.
-    const clientKvUrl   = requestParameters?.get('kvstoreUrl') || null
-    const effectiveKvUrl = resolveKvstoreUrl(clientKvUrl)
-    const username = await verifyToken(token, clientKvUrl)
-    if (!username) throw new Error('Invalid token')
+    // The token's own `iss` claim (verified, tamper-proof) is authoritative —
+    // a client-supplied kvstoreUrl is never consulted for verification or for
+    // the DID/namespace lookups below.
+    const identity = await verifyIdentity(token)
+    if (!identity) throw new Error('Invalid token')
+    const { username, iss } = identity
 
     // Resolve the user's portable DID (did:key preferred, did:web fallback,
-    // username@kvhost as last resort).  did:key survives kvstore migrations.
-    const didInfo  = await resolveUserDid(username, effectiveKvUrl)
-    const namespace = didInfo?.didKey || didInfo?.didWeb
-      || `${username}@${kvHostShort(effectiveKvUrl)}`
+    // qualifiedId as last resort).  did:key survives kvstore migrations.
+    const didInfo   = await resolveUserDid(username, iss)
+    const namespace = didInfo?.didKey || didInfo?.didWeb || identity.qualifiedId
 
     // Cache the user's DID info locally so the share page can display it
     // without an extra kvstore round-trip.
@@ -54,7 +51,7 @@ const server = Server.configure({
           username = excluded.username,
           kvhost = excluded.kvhost,
           registered_at = unixepoch()
-      `).run(didInfo.didKey, didInfo.didWeb || null, username, kvHostShort(effectiveKvUrl))
+      `).run(didInfo.didKey, didInfo.didWeb || null, username, kvHostShort(iss))
     }
 
     // Namespace validation: the part before the first '/' must match the

@@ -5,6 +5,7 @@
   "dependencies": {
     "@hocuspocus/server": "^2.13.5",
     "better-sqlite3": "^9.6.0",
+    "jose": "^5.9.6",
     "yjs": "^13.6.18"
   }
 }
